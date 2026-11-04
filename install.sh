@@ -5,7 +5,7 @@
 #
 # Usage:
 #   chmod +x install.sh
-#   ./install.sh              # install (on-demand; Zoom wrapper)
+#   ./install.sh              # install (on-demand wrappers for Zoom/Teams/WeChat/WhatsApp)
 #   ./install.sh --always-on  # also enable camera relay at boot
 #   ./install.sh --uninstall  # remove
 #
@@ -49,6 +49,7 @@ uninstall_all() {
   systemctl daemon-reload
   rm -f /usr/local/bin/surface-camera-relay.py \
         /usr/local/bin/surface-camera-relay.sh \
+        /usr/local/bin/app-with-camera.sh \
         /usr/local/bin/zoom-with-camera.sh \
         /etc/modprobe.d/v4l2-relayd.conf \
         /etc/modules-load.d/00-v4l2loopback.conf \
@@ -58,7 +59,18 @@ uninstall_all() {
         /etc/sudoers.d/surface-camera
   rm -f "$DESKTOP_DIR/Zoom摄像头.desktop" \
         "$DESKTOP_DIR/Zoom-with-Camera.desktop" \
-        "$REAL_HOME/.local/share/applications/zoom-with-camera.desktop"
+        "$DESKTOP_DIR/teams-with-camera.desktop" \
+        "$DESKTOP_DIR/wechat-with-camera.desktop" \
+        "$DESKTOP_DIR/whatsapp-with-camera.desktop" \
+        "$REAL_HOME/.local/share/applications/zoom-with-camera.desktop" \
+        "$REAL_HOME/.local/share/applications/teams-with-camera.desktop" \
+        "$REAL_HOME/.local/share/applications/wechat-with-camera.desktop" \
+        "$REAL_HOME/.local/share/applications/whatsapp-with-camera.desktop" \
+        "$REAL_HOME/.local/share/applications/us.zoom.Zoom.desktop" \
+        "$REAL_HOME/.local/share/applications/com.github.IsmaelMartinez.teams_for_linux.desktop" \
+        "$REAL_HOME/.local/share/applications/com.microsoft.Teams.desktop" \
+        "$REAL_HOME/.local/share/applications/com.tencent.WeChat.desktop" \
+        "$REAL_HOME/.local/share/applications/com.rtosta.zapzap.desktop"
   udevadm control --reload || true
   modprobe -r v4l2loopback 2>/dev/null || true
   echo "Uninstalled surface virtual camera."
@@ -314,40 +326,104 @@ exec /usr/local/bin/surface-camera-relay.py
 EOF
   chmod +x /usr/local/bin/surface-camera-relay.sh
 
-  cat >/usr/local/bin/zoom-with-camera.sh <<'EOF'
+  cat >/usr/local/bin/app-with-camera.sh <<'EOF'
 #!/bin/bash
-# Start virtual camera only while Zoom is running.
+# Start Surface virtual camera while an app runs (refcount-safe).
+# Usage:
+#   app-with-camera.sh flatpak <app-id> [args...]
+#   app-with-camera.sh run <command> [args...]
 set -euo pipefail
 
+REFDIR="${XDG_RUNTIME_DIR:-/tmp}/surface-camera-refs"
+mkdir -p "$REFDIR"
+REF="$REFDIR/$$"
+
 start_cam() {
+  touch "$REF"
   if ! systemctl is-active --quiet surface-camera.service; then
     sudo -n /bin/systemctl start surface-camera.service
   fi
   for _ in $(seq 1 40); do
     if systemctl is-active --quiet surface-camera.service \
       && v4l2-ctl -d /dev/video0 --get-fmt-video 2>/dev/null | grep -q "Width/Height"; then
+      for __ in $(seq 1 20); do
+        caps="$(v4l2-ctl -d /dev/video0 --all 2>/dev/null || true)"
+        if printf '%s\n' "$caps" | grep -q 'Video Capture' \
+          && ! printf '%s\n' "$caps" | awk '/Device Caps/,/Priority/' | grep -q 'Video Output'; then
+          return 0
+        fi
+        sleep 0.25
+      done
       return 0
     fi
     sleep 0.25
   done
+  echo "app-with-camera: camera did not become ready" >&2
+  return 1
 }
 
 stop_cam() {
-  sudo -n /bin/systemctl stop surface-camera.service 2>/dev/null || true
+  rm -f "$REF"
+  if [[ -z "$(find "$REFDIR" -mindepth 1 -maxdepth 1 -type f 2>/dev/null | head -n 1)" ]]; then
+    sudo -n /bin/systemctl stop surface-camera.service 2>/dev/null || true
+  fi
+}
+
+cleanup_stale_refs() {
+  local f base
+  for f in "$REFDIR"/*; do
+    [[ -e "$f" ]] || continue
+    base="$(basename "$f")"
+    [[ "$base" =~ ^[0-9]+$ ]] || continue
+    if ! kill -0 "$base" 2>/dev/null; then
+      rm -f "$f"
+    fi
+  done
 }
 
 trap stop_cam EXIT INT TERM
+
+if [[ $# -lt 1 ]]; then
+  echo "Usage: $0 flatpak <app-id> [args...] | run <cmd> [args...]" >&2
+  exit 2
+fi
+
+cleanup_stale_refs
+mode="$1"; shift
 start_cam
 
+set +e
+case "$mode" in
+  flatpak)
+    [[ $# -ge 1 ]] || { echo "flatpak app-id required" >&2; exit 2; }
+    flatpak run "$@"
+    rc=$?
+    ;;
+  run)
+    [[ $# -ge 1 ]] || { echo "command required" >&2; exit 2; }
+    "$@"
+    rc=$?
+    ;;
+  *)
+    echo "Unknown mode: $mode (use flatpak|run)" >&2
+    exit 2
+    ;;
+esac
+exit "$rc"
+EOF
+  chmod +x /usr/local/bin/app-with-camera.sh
+
+  cat >/usr/local/bin/zoom-with-camera.sh <<'EOF'
+#!/bin/bash
+# Start Surface virtual camera only while Zoom is running.
+set -euo pipefail
 if command -v flatpak >/dev/null && flatpak info us.zoom.Zoom >/dev/null 2>&1; then
-  flatpak run us.zoom.Zoom "$@"
+  exec /usr/local/bin/app-with-camera.sh flatpak us.zoom.Zoom "$@"
 elif command -v zoom >/dev/null; then
-  zoom "$@"
+  exec /usr/local/bin/app-with-camera.sh run zoom "$@"
 else
-  echo "Zoom not found (flatpak us.zoom.Zoom or zoom). Camera started; stop with:" >&2
-  echo "  sudo systemctl stop surface-camera" >&2
-  # Keep camera up until user hits Ctrl-C
-  while systemctl is-active --quiet surface-camera.service; do sleep 2; done
+  echo "Zoom not found (flatpak us.zoom.Zoom or zoom)." >&2
+  exit 1
 fi
 EOF
   chmod +x /usr/local/bin/zoom-with-camera.sh
@@ -422,33 +498,101 @@ EOF
   chown "$REAL_USER:$REAL_USER" \
     "$REAL_HOME/.config/wireplumber/wireplumber.conf.d/99-libcamera.conf"
 
-  # Desktop launcher
+  # Desktop launchers (on-demand camera for each Flatpak app that needs it)
   install -d -o "$REAL_USER" -g "$REAL_USER" "$DESKTOP_DIR" \
     "$REAL_HOME/.local/share/applications"
-  cat >"$DESKTOP_DIR/Zoom-with-Camera.desktop" <<'EOF'
+
+  write_app_launcher() {
+    local desk_name="$1" app_name="$2" app_name_zh="$3" icon="$4" exec_line="$5" wmclass="$6"
+    local desk="$DESKTOP_DIR/${desk_name}.desktop"
+    local app="$REAL_HOME/.local/share/applications/${desk_name}.desktop"
+    cat >"$desk" <<EOF
 [Desktop Entry]
 Version=1.0
 Type=Application
-Name=Zoom (Camera)
-Name[zh_CN]=Zoom（摄像头）
-Comment=Start Zoom with on-demand Surface virtual camera
-Comment[zh_CN]=打开 Zoom 并按需启动虚拟摄像头；退出后自动关闭
-Exec=/usr/local/bin/zoom-with-camera.sh
-Icon=us.zoom.Zoom
+Name=${app_name}
+Name[zh_CN]=${app_name_zh}
+Comment=Start with on-demand Surface virtual camera
+Comment[zh_CN]=打开应用并按需启动虚拟摄像头；退出后自动关闭
+Exec=${exec_line}
+Icon=${icon}
 Terminal=false
 Categories=Network;InstantMessaging;VideoConference;
 StartupNotify=true
-StartupWMClass=zoom
+StartupWMClass=${wmclass}
 EOF
-  cp "$DESKTOP_DIR/Zoom-with-Camera.desktop" \
-    "$REAL_HOME/.local/share/applications/zoom-with-camera.desktop"
-  chown "$REAL_USER:$REAL_USER" \
-    "$DESKTOP_DIR/Zoom-with-Camera.desktop" \
-    "$REAL_HOME/.local/share/applications/zoom-with-camera.desktop"
-  chmod +x "$DESKTOP_DIR/Zoom-with-Camera.desktop" \
-    "$REAL_HOME/.local/share/applications/zoom-with-camera.desktop"
-  sudo -u "$REAL_USER" gio set "$DESKTOP_DIR/Zoom-with-Camera.desktop" \
-    metadata::trusted true 2>/dev/null || true
+    cp "$desk" "$app"
+    chown "$REAL_USER:$REAL_USER" "$desk" "$app"
+    chmod +x "$desk" "$app"
+    sudo -u "$REAL_USER" gio set "$desk" metadata::trusted true 2>/dev/null || true
+  }
+
+  write_app_launcher Zoom-with-Camera "Zoom (Camera)" "Zoom（摄像头）" \
+    us.zoom.Zoom /usr/local/bin/zoom-with-camera.sh zoom
+
+  if flatpak info com.github.IsmaelMartinez.teams_for_linux >/dev/null 2>&1; then
+    write_app_launcher teams-with-camera "Teams (Camera)" "Teams（摄像头）" \
+      com.github.IsmaelMartinez.teams_for_linux \
+      "/usr/local/bin/app-with-camera.sh flatpak com.github.IsmaelMartinez.teams_for_linux" \
+      teams-for-linux
+  fi
+  if flatpak info com.tencent.WeChat >/dev/null 2>&1; then
+    write_app_launcher wechat-with-camera "WeChat (Camera)" "微信（摄像头）" \
+      com.tencent.WeChat \
+      "/usr/local/bin/app-with-camera.sh flatpak com.tencent.WeChat" \
+      wechat
+  fi
+  if flatpak info com.rtosta.zapzap >/dev/null 2>&1; then
+    write_app_launcher whatsapp-with-camera "WhatsApp (Camera)" "WhatsApp（摄像头）" \
+      com.rtosta.zapzap \
+      "/usr/local/bin/app-with-camera.sh flatpak com.rtosta.zapzap" \
+      zapzap
+  fi
+
+  # Override stock Flatpak .desktop Exec so menu icons also start the camera
+  wrap_flatpak_desktop() {
+    local flatpak_id="$1"
+    local src="" dst
+    for src in \
+      "/var/lib/flatpak/exports/share/applications/${flatpak_id}.desktop" \
+      "/usr/share/applications/${flatpak_id}.desktop" \
+      "$REAL_HOME/.local/share/flatpak/exports/share/applications/${flatpak_id}.desktop"
+    do
+      [[ -f "$src" ]] && break
+      src=""
+    done
+    [[ -n "$src" ]] || return 0
+    dst="$REAL_HOME/.local/share/applications/${flatpak_id}.desktop"
+    python3 - "$src" "$dst" <<'PY'
+import sys
+from pathlib import Path
+src, dst = Path(sys.argv[1]), Path(sys.argv[2])
+out = []
+for line in src.read_text(encoding="utf-8").splitlines(True):
+    if line.startswith("Exec="):
+        rest = line[len("Exec="):].rstrip("\n")
+        out.append(f"Exec=/usr/local/bin/app-with-camera.sh run {rest}\n")
+    else:
+        out.append(line)
+dst.write_text("".join(out), encoding="utf-8")
+PY
+    chown "$REAL_USER:$REAL_USER" "$dst"
+    chmod +x "$dst"
+  }
+
+  for app_id in \
+    us.zoom.Zoom \
+    com.github.IsmaelMartinez.teams_for_linux \
+    com.microsoft.Teams \
+    com.tencent.WeChat \
+    com.rtosta.zapzap
+  do
+    if flatpak info "$app_id" >/dev/null 2>&1; then
+      wrap_flatpak_desktop "$app_id"
+    fi
+  done
+  sudo -u "$REAL_USER" update-desktop-database \
+    "$REAL_HOME/.local/share/applications" 2>/dev/null || true
 }
 
 reload_stack() {
@@ -497,7 +641,7 @@ main_install() {
   echo
   echo "Done."
   echo "  Virtual device name : Surface Front Camera (/dev/video0 after reboot if needed)"
-  echo "  On-demand launcher  : $DESKTOP_DIR/Zoom-with-Camera.desktop"
+  echo "  On-demand launchers : Zoom / Teams / WeChat / WhatsApp (Camera) on Desktop"
   echo "  Manual start/stop   : sudo systemctl start|stop surface-camera"
   if [[ "$ALWAYS_ON" -eq 1 ]]; then
     echo "  Boot mode          : always-on (camera LED may stay lit)"
@@ -505,7 +649,8 @@ main_install() {
     echo "  Boot mode          : on-demand (recommended)"
   fi
   echo
-  echo "In Zoom: Settings → Video → select \"Surface Front Camera\"."
+  echo "Menu / desktop icons for Zoom, Teams, WeChat, WhatsApp are wrapped automatically."
+  echo "In each app: pick \"Surface Front Camera\" as the video device."
   echo "If /dev/video0 is not the virtual cam yet, reboot once."
 }
 
