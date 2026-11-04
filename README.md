@@ -14,19 +14,21 @@ This installs:
 - `v4l2loopback` virtual device named **Surface Front Camera**
 - a systemd relay service (`surface-camera.service`)
 - on-demand desktop launchers that start the camera only while the app is open
+- `update-initramfs -u` so `softdep` / module options apply on the next boot
 
 ### Options
 
 ```bash
-./install.sh --always-on   # enable relay at boot (camera LED stays on)
-./install.sh --uninstall   # remove everything this script installed
+./install.sh --always-on     # enable relay at boot (camera LED stays on)
+./install.sh --no-hide-raw   # do not lock down ipu3-* nodes (keep user libcamera/PipeWire)
+./install.sh --uninstall     # remove everything this script installed
 ```
 
 ## Requirements
 
 - Ubuntu / Linux Mint / Debian
 - Working libcamera stack ([linux-surface](https://github.com/linux-surface/linux-surface) kernel recommended)
-- `cam -l` should list your front camera
+- `cam -l` should list your front camera **before** install (or when using `--no-hide-raw`)
 - sudo access (installs DKMS module + system files)
 
 ## After install
@@ -59,7 +61,27 @@ app-with-camera.sh run firefox
 
 ## Notes
 
-- Raw `ipu3-*` nodes are hidden from apps so only the virtual webcam is visible.
+### Raw `ipu3-*` node permissions (default)
+
+By default the installer writes `99-hide-ipu3-v4l.rules` which sets `ipu3-cio2*` / `ipu3-imgu*` to `MODE=0600`, `GROUP=root`, and strips `uaccess`. The root `surface-camera` relay can still open them via libcamera; **unprivileged** clients cannot:
+
+- `cam -l` (without sudo) → `Permission denied` / empty camera list
+- WirePlumber `monitor.libcamera` (user session)
+- Browsers using the PipeWire Camera portal against the raw sensors
+
+This is intentional for Zoom/Electron: those apps otherwise enumerate unusable raw V4L2 nodes. Prefer the wrapped apps + **Surface Front Camera**.
+
+If you want native libcamera / PipeWire camera access when the relay is idle, reinstall with:
+
+```bash
+./install.sh --no-hide-raw
+```
+
+(On IPU6 machines that fill `/dev/video0`–`63`, a per-process `LD_PRELOAD` remapper such as [surface-zoom-bridge](https://github.com/luqqas96/surface-zoom-bridge) may be a better fit than hiding nodes globally.)
+
+### Other
+
 - Cheese / other libcamera apps may conflict while the relay is running.
-- Camera ACPI id is auto-detected via `cam -l` into `/etc/default/surface-camera`.
-- Electron/Chromium apps only list the device while the relay is running (`exclusive_caps`).
+- Camera ACPI id is auto-detected via `cam -l` into `/etc/default/surface-camera` (detection runs as root during install).
+- Electron/Chromium apps only list the loopback while a producer is active (`exclusive_caps`).
+- `softdep ipu3_cio2 pre: v4l2loopback` only affects early boot if `/etc/modprobe.d` is packed into the initramfs; install/uninstall run `update-initramfs -u` for that reason.
